@@ -150,6 +150,7 @@ class ProductionScheduler:
                     'reason': reason
                 }
                 order.pause_records.append(pause_record)
+                order.pause_count += 1
                 return True
         return False
 
@@ -298,10 +299,22 @@ class ProductionScheduler:
             order.assigned_machine = best_machine.machine_id
             order.scheduled_start = best_slot.start_time
             order.scheduled_end = best_slot.end_time
+            order.start_shift = self._get_shift_for_time(order.scheduled_start)
+            order.end_shift = self._get_shift_for_time(order.scheduled_end)
+            order.shift = order.start_shift
+            if order.original_scheduled_end is None:
+                order.original_scheduled_end = order.scheduled_end
             if order.status == OrderStatus.PENDING:
                 order.status = OrderStatus.NOT_STARTED
             return best_slot
 
+        return None
+
+    def _get_shift_for_time(self, dt: datetime) -> Optional[str]:
+        periods = self.calendar.get_working_periods(dt, dt + timedelta(hours=1))
+        for (p_start, p_end, shift) in periods:
+            if p_start <= dt <= p_end:
+                return shift.name
         return None
 
     def _find_best_slot_on_machine(self, order: Order, machine: PrintingMachine) -> Tuple[Optional[ScheduleSlot], Optional[datetime]]:
@@ -695,6 +708,141 @@ class ProductionScheduler:
                 return slot.order
         return None
 
+    def get_capacity_forecast(self, days: int = 3) -> Dict:
+        self._ensure_status_updated()
+
+        today = date.today()
+        forecast_dates = [today + timedelta(days=i) for i in range(days)]
+
+        machines_result: Dict[str, Dict] = {}
+        all_full_shifts: List[str] = []
+
+        for machine in self.machines:
+            machine_id = machine.machine_id
+            machine_name = machine.name
+            dates_result: Dict[date, Dict] = {}
+            slots = self.machine_schedules.get(machine_id, [])
+
+            total_capacity_hours = 0.0
+            total_used_hours = 0.0
+            full_shifts: List[str] = []
+
+            for d in forecast_dates:
+                day_start = datetime.combine(d, time(0, 0))
+                day_end = datetime.combine(d + timedelta(days=1), time(0, 0))
+                working_periods = self.calendar.get_working_periods(day_start, day_end)
+
+                shifts_result: Dict[str, Dict] = {}
+                daily_total_hours = 0.0
+                daily_used_hours = 0.0
+
+                for (p_start, p_end, shift) in working_periods:
+                    shift_name = shift.name
+                    total_hours = (p_end - p_start).total_seconds() / 3600.0
+
+                    order_ids: List[str] = []
+                    used_hours = 0.0
+
+                    for slot in slots:
+                        s_start = slot.start_time
+                        s_end = slot.end_time
+                        overlap_start = max(s_start, p_start)
+                        overlap_end = min(s_end, p_end)
+                        if overlap_start < overlap_end:
+                            overlap_hours = (overlap_end - overlap_start).total_seconds() / 3600.0
+                            used_hours += overlap_hours
+                            if slot.order.order_id not in order_ids:
+                                order_ids.append(slot.order.order_id)
+
+                    remaining_hours = max(0.0, total_hours - used_hours)
+                    utilization = used_hours / total_hours if total_hours > 0 else 0.0
+                    is_full = utilization >= 0.95
+
+                    shift_label = f"{d.month}月{d.day}日{shift_name}"
+                    if is_full:
+                        full_shifts.append(shift_label)
+                        if shift_label not in all_full_shifts:
+                            all_full_shifts.append(shift_label)
+
+                    shifts_result[shift_name] = {
+                        'total_hours': total_hours,
+                        'used_hours': used_hours,
+                        'remaining_hours': remaining_hours,
+                        'utilization': utilization,
+                        'is_full': is_full,
+                        'orders': order_ids
+                    }
+
+                    daily_total_hours += total_hours
+                    daily_used_hours += used_hours
+
+                daily_remaining_hours = max(0.0, daily_total_hours - daily_used_hours)
+                daily_utilization = daily_used_hours / daily_total_hours if daily_total_hours > 0 else 0.0
+
+                dates_result[d] = {
+                    'shifts': shifts_result,
+                    'daily_total_hours': daily_total_hours,
+                    'daily_used_hours': daily_used_hours,
+                    'daily_remaining_hours': daily_remaining_hours,
+                    'daily_utilization': daily_utilization
+                }
+
+                total_capacity_hours += daily_total_hours
+                total_used_hours += daily_used_hours
+
+            total_remaining_hours = max(0.0, total_capacity_hours - total_used_hours)
+            overall_utilization = total_used_hours / total_capacity_hours if total_capacity_hours > 0 else 0.0
+
+            if overall_utilization >= 0.9:
+                bottleneck_level = 'critical'
+            elif overall_utilization >= 0.75:
+                bottleneck_level = 'warning'
+            else:
+                bottleneck_level = 'normal'
+
+            machines_result[machine_id] = {
+                'machine_name': machine_name,
+                'dates': dates_result,
+                'summary': {
+                    'total_capacity_hours': total_capacity_hours,
+                    'total_used_hours': total_used_hours,
+                    'total_remaining_hours': total_remaining_hours,
+                    'overall_utilization': overall_utilization,
+                    'full_shifts': full_shifts,
+                    'bottleneck_level': bottleneck_level
+                }
+            }
+
+        bottleneck_machines: List[str] = []
+        for machine_id, m_data in machines_result.items():
+            util = m_data['summary']['overall_utilization']
+            if util >= 0.8:
+                bottleneck_machines.append(machine_id)
+
+        if bottleneck_machines:
+            non_bottleneck = []
+            for machine_id, m_data in machines_result.items():
+                util = m_data['summary']['overall_utilization']
+                if util < 0.7 and machine_id not in bottleneck_machines:
+                    non_bottleneck.append(machine_id)
+            if non_bottleneck:
+                recommended_action = f"产能紧张，建议分配到{non_bottleneck[0]}机器"
+            else:
+                recommended_action = f"产能紧张，瓶颈机器：{', '.join(bottleneck_machines)}，建议优化排程"
+        else:
+            recommended_action = "产能充足，运行正常"
+
+        return {
+            'forecast_dates': forecast_dates,
+            'machines': machines_result,
+            'summary': {
+                'forecast_days': days,
+                'all_full_shifts': all_full_shifts,
+                'bottleneck_machines': bottleneck_machines,
+                'recommended_action': recommended_action
+            }
+        }
+
     def generate_daily_report(self, report_date: date) -> Dict:
         self._ensure_status_updated()
 
@@ -706,6 +854,8 @@ class ProductionScheduler:
         total_in_production = 0
         total_delayed = 0
         total_sheets = 0
+        factory_total_pause_minutes = 0
+        factory_total_pause_count = 0
 
         for machine in self.machines:
             machine_id = machine.machine_id
@@ -713,10 +863,23 @@ class ProductionScheduler:
             completed_sheets = 0
             in_production_orders = []
             delayed_orders = []
+            machine_total_pause_minutes = 0
+            machine_total_pause_count = 0
+            orders_affected_by_pause: List[str] = []
 
             slots = self.machine_schedules.get(machine_id, [])
             for slot in slots:
                 order = slot.order
+                is_active_today = False
+                overlap_start = max(slot.start_time, report_start)
+                overlap_end = min(slot.end_time, report_end)
+                if overlap_start < overlap_end:
+                    is_active_today = True
+                if order.actual_start and report_start <= order.actual_start <= report_end:
+                    is_active_today = True
+                if order.actual_end and report_start <= order.actual_end <= report_end:
+                    is_active_today = True
+
                 if order.actual_end and report_start <= order.actual_end <= report_end:
                     completed_count += 1
                     completed_sheets += order.completed_sheets
@@ -728,10 +891,17 @@ class ProductionScheduler:
                         if order.is_delayed:
                             delayed_orders.append(order)
 
+                if is_active_today and order.pause_count > 0:
+                    machine_total_pause_minutes += order.total_pause_minutes
+                    machine_total_pause_count += order.pause_count
+                    orders_affected_by_pause.append(order.order_id)
+
             total_completed += completed_count
             total_in_production += len(in_production_orders)
             total_delayed += len(delayed_orders)
             total_sheets += completed_sheets
+            factory_total_pause_minutes += machine_total_pause_minutes
+            factory_total_pause_count += machine_total_pause_count
 
             day_start = datetime.combine(report_date, time(0, 0))
             day_end = datetime.combine(report_date + timedelta(days=1), time(0, 0))
@@ -752,7 +922,10 @@ class ProductionScheduler:
                 'completed_sheets': completed_sheets,
                 'in_production_orders': [o.order_id for o in in_production_orders],
                 'delayed_orders': [o.order_id for o in delayed_orders],
-                'utilization': utilization
+                'utilization': utilization,
+                'total_pause_minutes': machine_total_pause_minutes,
+                'total_pause_count': machine_total_pause_count,
+                'orders_affected_by_pause': orders_affected_by_pause
             }
 
         return {
@@ -762,6 +935,8 @@ class ProductionScheduler:
                 'total_completed': total_completed,
                 'total_in_production': total_in_production,
                 'total_delayed': total_delayed,
-                'total_sheets': total_sheets
+                'total_sheets': total_sheets,
+                'factory_total_pause_minutes': factory_total_pause_minutes,
+                'factory_total_pause_count': factory_total_pause_count
             }
         }

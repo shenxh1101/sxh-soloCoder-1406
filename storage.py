@@ -48,6 +48,10 @@ def order_to_dict(order: Order) -> Dict:
         "notes": order.notes,
         "pause_records": pause_records,
         "shift": order.shift,
+        "start_shift": order.start_shift,
+        "end_shift": order.end_shift,
+        "pause_count": order.pause_count,
+        "original_scheduled_end": _serialize_datetime(getattr(order, 'original_scheduled_end', None)),
     }
 
 
@@ -69,6 +73,10 @@ def dict_to_order(data: Dict) -> Order:
     order.actual_start = _deserialize_datetime(data.get("actual_start"))
     order.actual_end = _deserialize_datetime(data.get("actual_end"))
     order.shift = data.get("shift")
+    order.start_shift = data.get("start_shift")
+    order.end_shift = data.get("end_shift")
+    order.pause_count = data.get("pause_count", 0)
+    order.original_scheduled_end = _deserialize_datetime(data.get("original_scheduled_end"))
 
     raw_pause_records = data.get("pause_records", [])
     for pr in raw_pause_records:

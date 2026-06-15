@@ -29,6 +29,10 @@ class Order:
     notes: str = ""
     pause_records: List[Dict] = field(default_factory=list)
     shift: Optional[str] = None
+    start_shift: Optional[str] = None
+    end_shift: Optional[str] = None
+    pause_count: int = 0
+    original_scheduled_end: Optional[datetime] = None
 
     def production_hours(self, speed_per_hour: int) -> float:
         if speed_per_hour <= 0:
@@ -61,6 +65,28 @@ class Order:
         if not self.end_time or not self.is_delayed:
             return 0
         return (self.end_time.date() - self.delivery_date).days
+
+    @property
+    def total_pause_minutes(self) -> int:
+        total = 0
+        for record in self.pause_records:
+            pause_time = record.get("pause_time")
+            resume_time = record.get("resume_time")
+            if pause_time and resume_time:
+                delta = resume_time - pause_time
+                total += int(delta.total_seconds() // 60)
+        return total
+
+    @property
+    def pause_delay_minutes(self) -> int:
+        if self.original_scheduled_end and self.scheduled_end:
+            delta = self.scheduled_end - self.original_scheduled_end
+            return int(delta.total_seconds() // 60)
+        return self.total_pause_minutes
+
+    @property
+    def is_cross_shift(self) -> bool:
+        return bool(self.start_shift and self.end_shift and self.start_shift != self.end_shift)
 
 
 @dataclass

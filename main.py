@@ -16,6 +16,26 @@ def create_default_machines():
     ]
 
 
+def _format_shift_info(order):
+    if order.start_shift and order.end_shift:
+        if order.start_shift == order.end_shift:
+            return f"班次:{order.start_shift}"
+        else:
+            return f"班次:{order.start_shift}→{order.end_shift}（跨班）"
+    elif hasattr(order, 'shift') and order.shift:
+        return f"班次:{order.shift}"
+    return ""
+
+
+def _format_pause_info(order):
+    parts = []
+    if order.pause_count > 0:
+        parts.append(f"暂停{order.pause_count}次 累计{order.total_pause_minutes}分钟")
+    if order.pause_delay_minutes > 0:
+        parts.append(f"影响完工+{order.pause_delay_minutes}分钟")
+    return "  ".join(parts)
+
+
 def print_menu():
     print("\n" + "=" * 65)
     print("       印刷厂生产排程系统 v3.0")
@@ -27,6 +47,7 @@ def print_menu():
     print("  ┌───────────── 排程计划 ─────────────┐  ┌───────────── 数据交换 ─────────────┐")
     print("  │  4. 执行滚动排程     5. 紧急插单   │  │ 13. 导入订单CSV   14. 导出排程CSV   │")
     print("  │  6. 查看甘特图     11. 物料提醒    │  │ 15. 导出订单CSV                     │")
+    print("  │ 23. 产能预估视图                      │  │                                    │")
     print("  └─────────────────────────────────────┘  └────────────────────────────────────┘")
     print("  ┌───────────── 班次日历 ─────────────┐  ┌───────────── 数据管理 ─────────────┐")
     print("  │ 16. 班次设置       17. 节假日管理   │  │ 20. 保存数据       21. 加载数据     │")
@@ -43,12 +64,12 @@ def view_all_orders(scheduler: ProductionScheduler):
 
     scheduler.update_order_status_by_time()
 
-    print("\n" + "=" * 120)
+    print("\n" + "=" * 140)
     print("所有订单列表")
-    print("-" * 120)
+    print("-" * 140)
     print(f"{'订单号':<12} {'克重':<6} {'印张':<10} {'交货日期':<12} {'状态':<10} {'紧急':<6} "
-          f"{'机器':<8} {'计划开始':<16} {'计划结束':<16} {'进度':<8} {'延期':<6}")
-    print("-" * 120)
+          f"{'机器':<8} {'计划开始':<16} {'计划结束':<16} {'进度':<8} {'延期':<6} {'班次/暂停':<30}")
+    print("-" * 140)
 
     for order in sorted(scheduler.orders, key=lambda o: (o.delivery_date, -o.is_urgent)):
         urgent = "是" if order.is_urgent else "否"
@@ -58,9 +79,14 @@ def view_all_orders(scheduler: ProductionScheduler):
         progress = f"{order.progress:.0%}" if order.status == OrderStatus.IN_PRODUCTION else "-"
         delay = f"{order.delay_days}天" if order.is_delayed and order.status != OrderStatus.COMPLETED else "-"
 
+        shift_info = _format_shift_info(order)
+        pause_info = _format_pause_info(order)
+        extra_parts = [p for p in [shift_info, pause_info] if p]
+        extra_info = "  ".join(extra_parts) if extra_parts else "-"
+
         line = f"{order.order_id:<12} {order.paper_grammage:<5}g {order.sheet_count:<10} " \
                f"{order.delivery_date.strftime('%Y-%m-%d'):<12} {order.status.value:<10} {urgent:<6} " \
-               f"{machine:<8} {s_start:<16} {s_end:<16} {progress:<8} {delay:<6}"
+               f"{machine:<8} {s_start:<16} {s_end:<16} {progress:<8} {delay:<6} {extra_info:<30}"
 
         if order.is_delayed and order.status != OrderStatus.COMPLETED:
             line = "⚠️  " + line
@@ -71,14 +97,23 @@ def view_all_orders(scheduler: ProductionScheduler):
 
         print(line)
 
-    print("-" * 120)
+    print("-" * 140)
+    status_counts = {
+        '待排产': len(scheduler.get_orders_by_status(OrderStatus.PENDING)),
+        '未开工': len(scheduler.get_orders_by_status(OrderStatus.NOT_STARTED)),
+        '生产中': len(scheduler.get_orders_by_status(OrderStatus.IN_PRODUCTION)),
+        '暂停中': len(scheduler.get_orders_by_status(OrderStatus.PAUSED)),
+        '已完成': len(scheduler.get_orders_by_status(OrderStatus.COMPLETED)),
+    }
+    total_paused_orders = sum(1 for o in scheduler.orders if o.pause_count > 0 and o.status != OrderStatus.COMPLETED)
     print(f"总计: {len(scheduler.orders)} 个订单 | "
-          f"待排产:{len(scheduler.get_orders_by_status(OrderStatus.PENDING))} "
-          f"未开工:{len(scheduler.get_orders_by_status(OrderStatus.NOT_STARTED))} "
-          f"生产中:{len(scheduler.get_orders_by_status(OrderStatus.IN_PRODUCTION))} "
-          f"暂停中:{len(scheduler.get_orders_by_status(OrderStatus.PAUSED))} "
-          f"已完成:{len(scheduler.get_orders_by_status(OrderStatus.COMPLETED))}")
-    print("=" * 120)
+          f"待排产:{status_counts['待排产']} "
+          f"未开工:{status_counts['未开工']} "
+          f"生产中:{status_counts['生产中']} "
+          f"暂停中:{status_counts['暂停中']} "
+          f"已完成:{status_counts['已完成']}"
+          + (f" | 历史暂停:{total_paused_orders}" if total_paused_orders > 0 else ""))
+    print("=" * 140)
 
 
 def add_order(scheduler: ProductionScheduler, production_log: ProductionLog):
@@ -276,7 +311,8 @@ def view_gantt(scheduler: ProductionScheduler):
                 scheduler.machines,
                 scheduler.machine_schedules,
                 start_date,
-                end_date
+                end_date,
+                calendar=scheduler.calendar
             )
             print("\n" + chart)
         except ValueError:
@@ -293,7 +329,8 @@ def view_gantt(scheduler: ProductionScheduler):
             chart = generate_daily_gantt(
                 scheduler.machines,
                 scheduler.machine_schedules,
-                target_date
+                target_date,
+                calendar=scheduler.calendar
             )
             print("\n" + chart)
         except ValueError:
@@ -421,15 +458,19 @@ def filter_orders_by_status(scheduler: ProductionScheduler):
         return
 
     print(f"\n{status.value}订单列表 ({len(orders)} 个):")
-    print("-" * 90)
-    print(f"{'订单号':<12} {'克重':<6} {'印张':<10} {'交货日期':<12} {'机器':<8} {'计划结束':<16} {'进度':<8}")
-    print("-" * 90)
+    print("-" * 130)
+    print(f"{'订单号':<12} {'克重':<6} {'印张':<10} {'交货日期':<12} {'机器':<8} {'计划结束':<16} {'进度':<8} {'班次/暂停':<40}")
+    print("-" * 130)
     for order in sorted(orders, key=lambda o: o.delivery_date):
         machine = order.assigned_machine or "-"
         s_end = order.scheduled_end.strftime("%m-%d %H:%M") if order.scheduled_end else "-"
         progress = f"{order.progress:.0%}" if order.status == OrderStatus.IN_PRODUCTION else "-"
+        shift_info = _format_shift_info(order)
+        pause_info = _format_pause_info(order)
+        extra_parts = [p for p in [shift_info, pause_info] if p]
+        extra_info = "  ".join(extra_parts) if extra_parts else "-"
         print(f"{order.order_id:<12} {order.paper_grammage:<5}g {order.sheet_count:<10} "
-              f"{order.delivery_date.strftime('%Y-%m-%d'):<12} {machine:<8} {s_end:<16} {progress:<8}")
+              f"{order.delivery_date.strftime('%Y-%m-%d'):<12} {machine:<8} {s_end:<16} {progress:<8} {extra_info:<40}")
 
 
 def mark_order_started(scheduler: ProductionScheduler, production_log: ProductionLog):
@@ -989,6 +1030,8 @@ def manage_pause_resume(scheduler: ProductionScheduler, production_log: Producti
                     production_log.add_event('order_paused', target_order.order_id,
                                           target_order.assigned_machine, f"暂停原因: {reason}")
                     print(f"订单 {target_order.order_id} 已暂停。")
+                    print(f"已暂停 {target_order.pause_count} 次，累计暂停 {target_order.total_pause_minutes} 分钟")
+                    print(f"下次执行滚动排程将重新计算顺延影响")
                 else:
                     print("暂停失败！")
             else:
@@ -1007,6 +1050,7 @@ def manage_pause_resume(scheduler: ProductionScheduler, production_log: Producti
                     production_log.add_event('order_resumed', target_order.order_id,
                                               target_order.assigned_machine, "订单恢复生产")
                     print(f"订单 {target_order.order_id} 已恢复生产。")
+                    print(f"本次暂停已记录，累计 {target_order.total_pause_minutes} 分钟")
                 else:
                     print("恢复失败！")
             else:
@@ -1181,6 +1225,123 @@ def load_data_ui(datastore: DataStore, scheduler: ProductionScheduler, productio
         print(f"  数据保存时间: {data['saved_at']}")
 
 
+def show_capacity_forecast(scheduler: ProductionScheduler):
+    print("\n--- 产能预估视图 ---")
+    days_str = input("预估天数(回车默认3): ").strip()
+    try:
+        days = int(days_str) if days_str else 3
+        if days <= 0:
+            print("错误: 天数必须大于0！")
+            return
+    except ValueError:
+        print("错误: 输入格式不正确！")
+        return
+
+    forecast = scheduler.get_capacity_forecast(days)
+    forecast_dates = forecast.get('forecast_dates', [])
+    machines = forecast.get('machines', {})
+    summary = forecast.get('summary', {})
+
+    start_date = forecast_dates[0].strftime('%Y-%m-%d') if forecast_dates else '-'
+    end_date = forecast_dates[-1].strftime('%Y-%m-%d') if forecast_dates else '-'
+    today = date.today()
+
+    RED = '\033[91m'
+    YELLOW = '\033[93m'
+    GREEN = '\033[92m'
+    RESET = '\033[0m'
+
+    print(f"\n{'='*100}")
+    print(f"              未来{days}天产能预估 (日期范围: {start_date} ~ {end_date})")
+    print(f"{'='*100}")
+
+    for machine_id, m_data in machines.items():
+        machine_name = m_data.get('machine_name', machine_id)
+        m_summary = m_data.get('summary', {})
+        overall_util = m_summary.get('overall_utilization', 0)
+        bottleneck = m_summary.get('bottleneck_level', 'normal')
+        total_cap = m_summary.get('total_capacity_hours', 0)
+        total_used = m_summary.get('total_used_hours', 0)
+        total_remain = m_summary.get('total_remaining_hours', 0)
+        full_shifts = m_summary.get('full_shifts', [])
+
+        if bottleneck == 'critical':
+            level_str = f"{RED}瓶颈critical{RESET}"
+        elif bottleneck == 'warning':
+            level_str = f"{YELLOW}警告warning{RESET}"
+        else:
+            level_str = f"{GREEN}正常normal{RESET}"
+
+        print(f"\n🖨️  机器: {machine_name} ({machine_id})  利用率: {overall_util:.0%}  {level_str}")
+        print("-" * 100)
+
+        m_dates = m_data.get('dates', {})
+        for d in forecast_dates:
+            d_data = m_dates.get(d)
+            if not d_data:
+                continue
+            date_str = d.strftime('%Y-%m-%d')
+            today_mark = "  ▶今天" if d == today else ""
+            print(f"  📅 {date_str}{today_mark}")
+
+            shifts = d_data.get('shifts', {})
+            for shift_name, s_data in shifts.items():
+                total = s_data.get('total_hours', 0)
+                used = s_data.get('used_hours', 0)
+                remain = s_data.get('remaining_hours', 0)
+                util = s_data.get('utilization', 0)
+                is_full = s_data.get('is_full', False)
+                orders = s_data.get('orders', [])
+
+                line = f"    {shift_name}: 总{total:.1f}h / 已用{used:.1f}h / 剩余{remain:.1f}h / 利用率{util:.0%}"
+                if is_full:
+                    line += f"  {RED}【已塞满】{RESET}"
+                print(line)
+
+                if orders:
+                    order_display = ','.join(orders[:3])
+                    if len(orders) > 3:
+                        order_display += '...'
+                    print(f"      订单数:{len(orders)} {order_display}")
+
+            daily_total = d_data.get('daily_total_hours', 0)
+            daily_used = d_data.get('daily_used_hours', 0)
+            daily_remaining = d_data.get('daily_remaining_hours', 0)
+            daily_util = d_data.get('daily_utilization', 0)
+            print(f"    📊 合计: {daily_total:.1f}/{daily_used:.1f}/{daily_remaining:.1f}h 利用率{daily_util:.0%}")
+
+        print(f"  {'='*90}")
+        print(f"  📈 机器汇总: 总容量{total_cap:.1f}h 已用{total_used:.1f}h 剩余{total_remain:.1f}h 利用率{overall_util:.0%}")
+        if full_shifts:
+            print(f"  {RED}⚠️  已塞满班次: {', '.join(full_shifts)}{RESET}")
+
+    print(f"\n{'='*100}")
+    print("🏭 全厂汇总")
+    print(f"{'='*100}")
+
+    all_full = summary.get('all_full_shifts', [])
+    bottleneck_machines = summary.get('bottleneck_machines', [])
+    recommended = summary.get('recommended_action', '')
+
+    if all_full:
+        print(f"  {RED}⚠️  已塞满的班次 ({len(all_full)} 个):{RESET}")
+        for fs in all_full:
+            print(f"      - {fs}")
+    else:
+        print(f"  {GREEN}✅ 没有已塞满的班次{RESET}")
+
+    if bottleneck_machines:
+        print(f"  {RED}🔴 瓶颈机器 ({len(bottleneck_machines)} 台):{RESET}")
+        for bm in bottleneck_machines:
+            bm_name = machines.get(bm, {}).get('machine_name', bm)
+            print(f"      - {bm_name} ({bm})")
+    else:
+        print(f"  {GREEN}✅ 无瓶颈机器{RESET}")
+
+    print(f"\n  💡 建议: {recommended}")
+    print(f"{'='*100}")
+
+
 def export_daily_report_ui(scheduler: ProductionScheduler):
     print("\n--- 生产日报导出 ---")
     date_str = input("请输入日期 (YYYY-MM-DD, 回车默认今天): ").strip()
@@ -1195,9 +1356,9 @@ def export_daily_report_ui(scheduler: ProductionScheduler):
 
     report = scheduler.generate_daily_report(report_date)
 
-    print(f"\n{'='*70}")
+    print(f"\n{'='*90}")
     print(f"                  生产日报 - {report_date.strftime('%Y-%m-%d')}")
-    print(f"{'='*70}")
+    print(f"{'='*90}")
 
     summary = report.get('summary', {})
     print(f"\n📊 汇总统计:")
@@ -1205,23 +1366,37 @@ def export_daily_report_ui(scheduler: ProductionScheduler):
     print(f"  在制订单数: {summary.get('total_in_production', 0)}")
     print(f"  延期订单数: {summary.get('total_delayed', 0)}")
     print(f"  完成总印张: {summary.get('total_sheets', 0)}")
+    factory_pause_min = summary.get('factory_total_pause_minutes', 0)
+    factory_pause_cnt = summary.get('factory_total_pause_count', 0)
+    if factory_pause_min > 0 or factory_pause_cnt > 0:
+        print(f"  全厂暂停累计: {factory_pause_min}分钟/{factory_pause_cnt}次")
 
     print(f"\n⚙️  各机器详情:")
-    print("-" * 70)
-    print(f"{'机器':<15} {'完成数':<8} {'完成印张':<10} {'在制订单':<20} {'延期订单':<15} {'利用率':<8}")
-    print("-" * 70)
+    print("-" * 90)
+    print(f"{'机器':<12} {'完成数':<6} {'完成印张':<8} {'在制订单':<18} {'延期':<12} {'利用率':<6} {'暂停/受影响':<30}")
+    print("-" * 90)
     machines = report.get('machines', {})
     for machine_id, machine_data in machines.items():
         utilization = machine_data.get('utilization', 0)
         in_prod = '、'.join(machine_data.get('in_production_orders', [])) or '-'
         delayed = '、'.join(machine_data.get('delayed_orders', [])) or '-'
-        print(f"{machine_data.get('machine_name', machine_id):<15} "
-              f"{machine_data.get('completed_count', 0):<8} "
-              f"{machine_data.get('completed_sheets', 0):<10} "
-              f"{in_prod:<20} "
-              f"{delayed:<15} "
-              f"{utilization:.0%}")
-    print("-" * 70)
+        pause_min = machine_data.get('total_pause_minutes', 0)
+        pause_cnt = machine_data.get('total_pause_count', 0)
+        affected = machine_data.get('orders_affected_by_pause', [])
+        pause_parts = []
+        if pause_min > 0 or pause_cnt > 0:
+            pause_parts.append(f"暂停:{pause_min}分钟/{pause_cnt}次")
+        if affected:
+            pause_parts.append(f"受影响: {','.join(affected)}")
+        pause_str = '  '.join(pause_parts) or '-'
+        print(f"{machine_data.get('machine_name', machine_id):<12} "
+              f"{machine_data.get('completed_count', 0):<6} "
+              f"{machine_data.get('completed_sheets', 0):<8} "
+              f"{in_prod:<18} "
+              f"{delayed:<12} "
+              f"{utilization:.0%}   "
+              f"{pause_str:<30}")
+    print("-" * 90)
 
     export_confirm = input("\n是否导出CSV? (Y/n): ").strip().lower()
     if not export_confirm or export_confirm in ('y', 'yes', '是'):
@@ -1283,7 +1458,7 @@ def main():
 
     while True:
         print_menu()
-        choice = input("\n请选择操作 (0-22): ").strip()
+        choice = input("\n请选择操作 (0-23): ").strip()
 
         need_autosave = False
 
@@ -1353,6 +1528,8 @@ def main():
             need_autosave = True
         elif choice == '22':
             export_daily_report_ui(scheduler)
+        elif choice == '23':
+            show_capacity_forecast(scheduler)
         else:
             print("无效选择，请重新输入！")
 
