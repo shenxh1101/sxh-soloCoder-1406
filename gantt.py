@@ -9,6 +9,7 @@ STATUS_BLOCKS = {
     OrderStatus.IN_PRODUCTION: '█',
     OrderStatus.NOT_STARTED: '▓',
     OrderStatus.PENDING: '□',
+    OrderStatus.PAUSED: '▒',
 }
 
 STATUS_LABELS = {
@@ -16,6 +17,7 @@ STATUS_LABELS = {
     OrderStatus.IN_PRODUCTION: '生产中',
     OrderStatus.NOT_STARTED: '未开工',
     OrderStatus.PENDING: '待排产',
+    OrderStatus.PAUSED: '暂停中',
 }
 
 

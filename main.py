@@ -1,9 +1,11 @@
 import sys
-from datetime import date, datetime, timedelta
-from models import Order, PrintingMachine, OrderStatus
+from datetime import date, datetime, timedelta, time
+from models import Order, PrintingMachine, OrderStatus, DowntimeRecord
 from scheduler import ProductionScheduler
+from work_calendar import WorkCalendar, Shift, ShiftType
+from storage import DataStore, ProductionLog
 from gantt import generate_gantt_chart, generate_daily_gantt
-from csv_io import import_orders_from_csv, export_orders_to_csv, export_schedule_to_csv
+from csv_io import import_orders_from_csv, export_orders_to_csv, export_schedule_to_csv, export_daily_report_to_csv
 
 
 def create_default_machines():
@@ -16,7 +18,7 @@ def create_default_machines():
 
 def print_menu():
     print("\n" + "=" * 65)
-    print("       印刷厂生产排程系统 v2.0")
+    print("       印刷厂生产排程系统 v3.0")
     print("=" * 65)
     print("  ┌───────────── 订单管理 ─────────────┐  ┌───────────── 生产执行 ─────────────┐")
     print("  │  1. 查看所有订单      2. 添加订单   │  │  7. 登记开工        8. 登记完工     │")
@@ -25,6 +27,10 @@ def print_menu():
     print("  ┌───────────── 排程计划 ─────────────┐  ┌───────────── 数据交换 ─────────────┐")
     print("  │  4. 执行滚动排程     5. 紧急插单   │  │ 13. 导入订单CSV   14. 导出排程CSV   │")
     print("  │  6. 查看甘特图     11. 物料提醒    │  │ 15. 导出订单CSV                     │")
+    print("  └─────────────────────────────────────┘  └────────────────────────────────────┘")
+    print("  ┌───────────── 班次日历 ─────────────┐  ┌───────────── 数据管理 ─────────────┐")
+    print("  │ 16. 班次设置       17. 节假日管理   │  │ 20. 保存数据       21. 加载数据     │")
+    print("  │ 18. 登记暂停       19. 异常停机登记 │  │ 22. 生产日报导出                   │")
     print("  └─────────────────────────────────────┘  └────────────────────────────────────┘")
     print("  0. 退出系统")
     print("=" * 65)
@@ -60,6 +66,8 @@ def view_all_orders(scheduler: ProductionScheduler):
             line = "⚠️  " + line
         elif order.is_urgent and order.status != OrderStatus.COMPLETED:
             line = "⚡ " + line
+        elif order.status == OrderStatus.PAUSED:
+            line = "⏸️  " + line
 
         print(line)
 
@@ -68,11 +76,12 @@ def view_all_orders(scheduler: ProductionScheduler):
           f"待排产:{len(scheduler.get_orders_by_status(OrderStatus.PENDING))} "
           f"未开工:{len(scheduler.get_orders_by_status(OrderStatus.NOT_STARTED))} "
           f"生产中:{len(scheduler.get_orders_by_status(OrderStatus.IN_PRODUCTION))} "
+          f"暂停中:{len(scheduler.get_orders_by_status(OrderStatus.PAUSED))} "
           f"已完成:{len(scheduler.get_orders_by_status(OrderStatus.COMPLETED))}")
     print("=" * 120)
 
 
-def add_order(scheduler: ProductionScheduler):
+def add_order(scheduler: ProductionScheduler, production_log: ProductionLog):
     print("\n--- 添加新订单 ---")
     try:
         order_id = input("订单号: ").strip()
@@ -121,6 +130,7 @@ def add_order(scheduler: ProductionScheduler):
                 return
 
         scheduler.add_order(order)
+        production_log.add_event('order_added', order_id, None, f"添加订单: 克重{paper_grammage}g, 印张{sheet_count}")
         print(f"\n订单 {order_id} 添加成功！建议执行 [4. 执行滚动排程] 更新计划。")
 
     except ValueError:
@@ -165,17 +175,17 @@ def modify_order_delivery(scheduler: ProductionScheduler):
     print("建议执行 [4. 执行滚动排程] 重新计算计划。")
 
 
-def run_schedule(scheduler: ProductionScheduler):
+def run_schedule(scheduler: ProductionScheduler, production_log: ProductionLog):
     print("\n--- 执行滚动排程 ---")
 
     total_orders = len(scheduler.orders)
     locked_count = len([o for o in scheduler.orders
-                      if o.status in (OrderStatus.IN_PRODUCTION, OrderStatus.COMPLETED)])
+                      if o.status in (OrderStatus.IN_PRODUCTION, OrderStatus.COMPLETED, OrderStatus.PAUSED)])
     pending_count = len([o for o in scheduler.orders
                         if o.status in (OrderStatus.PENDING, OrderStatus.NOT_STARTED)])
 
     print(f"当前总订单数: {total_orders}")
-    print(f"  - 锁定订单 (生产中/已完成): {locked_count}")
+    print(f"  - 锁定订单 (生产中/暂停中/已完成): {locked_count}")
     print(f"  - 待排程订单: {pending_count}")
 
     if pending_count == 0 and locked_count == 0:
@@ -188,6 +198,7 @@ def run_schedule(scheduler: ProductionScheduler):
         return
 
     result = scheduler.schedule_all(reschedule_all=True)
+    production_log.add_event('schedule_run', None, None, f"执行滚动排程, 排程{result['scheduled_count']}个订单")
 
     print(f"\n{'='*60}")
     print("排程完成！")
@@ -204,7 +215,9 @@ def run_schedule(scheduler: ProductionScheduler):
             last_end = max(s.end_time for s in machine_slots)
             total_hours = sum((s.end_time - s.start_time).total_seconds() / 3600.0 for s in machine_slots)
             total_days = (last_end.date() - first_start.date()).days + 1
-            available_hours = total_days * 12
+            day_start = datetime.combine(first_start.date(), time(0, 0))
+            day_end = datetime.combine(last_end.date() + timedelta(days=1), time(0, 0))
+            available_hours = scheduler.calendar.total_working_hours_between(day_start, day_end)
             utilization = total_hours / available_hours if available_hours > 0 else 0
             print(f"  {machine.name}: {len(machine_slots)} 单, "
                   f"{first_start.strftime('%m-%d')} ~ {last_end.strftime('%m-%d')}, "
@@ -307,7 +320,7 @@ def view_gantt(scheduler: ProductionScheduler):
                 print("")
 
 
-def insert_urgent_order(scheduler: ProductionScheduler):
+def insert_urgent_order(scheduler: ProductionScheduler, production_log: ProductionLog):
     print("\n--- 紧急插单 ---")
     try:
         order_id = input("紧急订单号: ").strip()
@@ -347,6 +360,8 @@ def insert_urgent_order(scheduler: ProductionScheduler):
 
         print(f"\n插入紧急订单后将重新排程所有未完成订单...")
         result = scheduler.insert_urgent_order(urgent_order)
+        production_log.add_event('order_added', order_id, None, f"紧急插单: 克重{paper_grammage}g, 印张{sheet_count}")
+        production_log.add_event('schedule_run', None, None, "紧急插单后重新排程")
 
         print(f"\n{'='*60}")
         print("紧急插单完成！")
@@ -383,14 +398,16 @@ def filter_orders_by_status(scheduler: ProductionScheduler):
     print("  1. 待排产")
     print("  2. 未开工 (已排产)")
     print("  3. 生产中")
-    print("  4. 已完成")
-    choice = input("请选择 (1-4): ").strip()
+    print("  4. 暂停中")
+    print("  5. 已完成")
+    choice = input("请选择 (1-5): ").strip()
 
     status_map = {
         '1': OrderStatus.PENDING,
         '2': OrderStatus.NOT_STARTED,
         '3': OrderStatus.IN_PRODUCTION,
-        '4': OrderStatus.COMPLETED,
+        '4': OrderStatus.PAUSED,
+        '5': OrderStatus.COMPLETED,
     }
 
     status = status_map.get(choice)
@@ -415,7 +432,7 @@ def filter_orders_by_status(scheduler: ProductionScheduler):
               f"{order.delivery_date.strftime('%Y-%m-%d'):<12} {machine:<8} {s_end:<16} {progress:<8}")
 
 
-def mark_order_started(scheduler: ProductionScheduler):
+def mark_order_started(scheduler: ProductionScheduler, production_log: ProductionLog):
     print("\n--- 登记订单开工 ---")
     not_started = scheduler.get_orders_by_status(OrderStatus.NOT_STARTED)
 
@@ -458,6 +475,8 @@ def mark_order_started(scheduler: ProductionScheduler):
 
             if scheduler.mark_order_started(target_order.order_id, start_time):
                 actual_time = start_time or datetime.now()
+                production_log.add_event('order_started', target_order.order_id, target_order.assigned_machine,
+                                      f"订单开工: {target_order.order_id} 开工时间: {actual_time.strftime('%Y-%m-%d %H:%M')}")
                 print(f"订单 {target_order.order_id} 已登记开工，开工时间: {actual_time.strftime('%Y-%m-%d %H:%M')}")
             else:
                 print("标记失败！")
@@ -467,7 +486,7 @@ def mark_order_started(scheduler: ProductionScheduler):
         print("输入无效！")
 
 
-def mark_order_completed_ui(scheduler: ProductionScheduler):
+def mark_order_completed_ui(scheduler: ProductionScheduler, production_log: ProductionLog):
     print("\n--- 登记订单完工 ---")
     in_production = scheduler.get_orders_by_status(OrderStatus.IN_PRODUCTION)
     not_started = scheduler.get_orders_by_status(OrderStatus.NOT_STARTED)
@@ -519,6 +538,8 @@ def mark_order_completed_ui(scheduler: ProductionScheduler):
             if scheduler.mark_order_completed(target_order.order_id, end_time, completed_sheets):
                 actual_time = end_time or datetime.now()
                 sheets = completed_sheets or target_order.sheet_count
+                production_log.add_event('order_completed', target_order.order_id, target_order.assigned_machine,
+                                      f"订单完工: {target_order.order_id} 完成印张: {sheets}")
                 print(f"订单 {target_order.order_id} 已登记完工，完工时间: {actual_time.strftime('%Y-%m-%d %H:%M')}，完成印张: {sheets}")
             else:
                 print("标记失败！")
@@ -578,10 +599,13 @@ def update_order_progress_ui(scheduler: ProductionScheduler):
         print("输入无效！")
 
 
-def auto_update_status(scheduler: ProductionScheduler):
+def auto_update_status(scheduler: ProductionScheduler, production_log: ProductionLog):
     print("\n--- 自动更新订单状态 ---")
     now = datetime.now()
     result = scheduler.update_order_status_by_time(now)
+
+    production_log.add_event('status_auto_updated', None, None,
+                          f"自动更新: 开工{result['started']}个, 完工{result['completed']}个")
 
     print(f"当前时间: {now.strftime('%Y-%m-%d %H:%M:%S')}")
     print("-" * 40)
@@ -593,6 +617,7 @@ def auto_update_status(scheduler: ProductionScheduler):
     print(f"  待排产: {len(scheduler.get_orders_by_status(OrderStatus.PENDING))}")
     print(f"  未开工: {len(scheduler.get_orders_by_status(OrderStatus.NOT_STARTED))}")
     print(f"  生产中: {len(scheduler.get_orders_by_status(OrderStatus.IN_PRODUCTION))}")
+    print(f"  暂停中: {len(scheduler.get_orders_by_status(OrderStatus.PAUSED))}")
     print(f"  已完成: {len(scheduler.get_orders_by_status(OrderStatus.COMPLETED))}")
 
 
@@ -690,7 +715,7 @@ def show_material_suggestions(scheduler: ProductionScheduler):
     print("\n提示: 将相同纸张的订单连续安排生产，可减少换单清洗时间。")
 
 
-def import_orders(scheduler: ProductionScheduler):
+def import_orders(scheduler: ProductionScheduler, production_log: ProductionLog):
     print("\n--- 导入订单 (CSV) ---")
     file_path = input("CSV文件路径: ").strip()
 
@@ -724,6 +749,7 @@ def import_orders(scheduler: ProductionScheduler):
 
     for order in result['orders']:
         scheduler.add_order(order)
+        production_log.add_event('order_added', order.order_id, None, f"从CSV导入订单")
 
     if result['success'] > 0:
         print(f"\n成功导入 {result['success']} 个新订单！建议执行 [4. 执行滚动排程] 更新计划。")
@@ -760,15 +786,496 @@ def export_orders(scheduler: ProductionScheduler):
         print("提示: 导出的文件可以直接通过 [13. 导入订单CSV] 导回系统。")
 
 
+def manage_shifts(scheduler: ProductionScheduler):
+    print("\n--- 班次设置 ---")
+    print("  1. 查看当前班次配置")
+    print("  2. 设置单班 (白班 8:00-20:00)")
+    print("  3. 设置双班 (白班 8:00-20:00, 夜班 20:00-8:00)")
+    print("  4. 自定义班次")
+    choice = input("请选择 (1-4, 默认1): ").strip() or "1"
+
+    if choice == "1":
+        print("\n当前班次配置:")
+        print("-" * 60)
+        if not scheduler.calendar.shifts:
+            print("  (暂无班次配置)")
+        else:
+            for i, shift in enumerate(scheduler.calendar.shifts, 1):
+                print(f"  {i}. {shift.name}")
+                print(f"     时间: {shift.start_time.strftime('%H:%M')} - {shift.end_time.strftime('%H:%M')}")
+                print(f"     类型: {shift.shift_type.value}")
+                print(f"     时长: {shift.daily_hours():.1f} 小时")
+        print("-" * 60)
+
+    elif choice == "2":
+        shifts = [
+            Shift("白班", time(8, 0), time(20, 0), ShiftType.DAY)
+        ]
+        scheduler.calendar.set_shifts(shifts)
+        print("\n已设置为单班制 (白班 8:00-20:00)")
+        print("提示: 下次执行排程时生效。")
+
+    elif choice == "3":
+        shifts = [
+            Shift("白班", time(8, 0), time(20, 0), ShiftType.DAY),
+            Shift("夜班", time(20, 0), time(8, 0), ShiftType.NIGHT)
+        ]
+        scheduler.calendar.set_shifts(shifts)
+        print("\n已设置为双班制:")
+        print("  白班: 08:00 - 20:00")
+        print("  夜班: 20:00 - 次日 08:00")
+        print("提示: 下次执行排程时生效。")
+
+    elif choice == "4":
+        try:
+            n_str = input("请输入班次数量: ").strip()
+            n = int(n_str)
+            if n <= 0:
+                print("错误: 班次数量必须大于0！")
+                return
+            shifts = []
+            for i in range(n):
+                print(f"\n--- 第 {i+1} 个班次:")
+                name = input(f"  班次名称: ").strip() or f"班次{i+1}"
+                start_str = input("  开始时间 (HH:MM): ").strip()
+                end_str = input("  结束时间 (HH:MM): ").strip()
+                type_choice = input("  班次类型: 1.白班 2.夜班 3.全天 (默认1): ").strip() or "1"
+                type_map = {"1": ShiftType.DAY, "2": ShiftType.NIGHT, "3": ShiftType.FULL}
+                shift_type = type_map.get(type_choice, ShiftType.DAY)
+                try:
+                    start = datetime.strptime(start_str, "%H:%M").time()
+                    end = datetime.strptime(end_str, "%H:%M").time()
+                    shifts.append(Shift(name, start, end, shift_type))
+                except ValueError:
+                        print("错误: 时间格式不正确！")
+                        return
+            scheduler.calendar.set_shifts(shifts)
+            print(f"\n已设置 {len(shifts)} 个班次！")
+            print("提示: 下次执行排程时生效。")
+        except ValueError:
+            print("错误: 输入格式不正确！")
+
+    else:
+        print("无效选择！")
+
+
+def manage_holidays(scheduler: ProductionScheduler):
+    print("\n--- 节假日管理 ---")
+    print("  1. 查看节假日列表")
+    print("  2. 添加节假日")
+    print("  3. 删除节假日")
+    print("  4. 批量添加节假日")
+    print("  5. 清空所有节假日")
+    choice = input("请选择 (1-5, 默认1): ").strip() or "1"
+
+    if choice == "1":
+        print("\n已设置的节假日:")
+        print("-" * 40)
+        if not scheduler.calendar.holidays:
+            print("  (暂无节假日)")
+        else:
+            for i, d in enumerate(sorted(scheduler.calendar.holidays), 1):
+                weekday_names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+                print(f"  {i}. {d.strftime('%Y-%m-%d')} ({weekday_names[d.weekday()]})")
+        print("-" * 40)
+
+    elif choice == "2":
+        date_str = input("请输入节假日日期 (YYYY-MM-DD): ").strip()
+        try:
+            d = datetime.strptime(date_str, "%Y-%m-%d").date()
+            scheduler.calendar.add_holiday(d)
+            print(f"\n已添加节假日: {d.strftime('%Y-%m-%d')}")
+        except ValueError:
+            print("错误: 日期格式不正确！")
+
+    elif choice == "3":
+        if not scheduler.calendar.holidays:
+            print("\n暂无节假日可删除。")
+            return
+        print("\n已设置的节假日:")
+        for i, d in enumerate(sorted(scheduler.calendar.holidays), 1):
+            weekday_names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+            print(f"  {i}. {d.strftime('%Y-%m-%d')} ({weekday_names[d.weekday()]})")
+        idx_str = input("请输入要删除的序号: ").strip()
+        try:
+            idx = int(idx_str) - 1
+            holidays_list = sorted(scheduler.calendar.holidays)
+            if 0 <= idx < len(holidays_list):
+                scheduler.calendar.remove_holiday(holidays_list[idx])
+                print(f"\n已删除节假日: {holidays_list[idx].strftime('%Y-%m-%d')}")
+            else:
+                print("无效序号！")
+        except ValueError:
+            print("错误: 输入格式不正确！")
+
+    elif choice == "4":
+        start_str = input("请输入开始日期 (YYYY-MM-DD): ").strip()
+        days_str = input("请输入天数: ").strip()
+        try:
+            start_date = datetime.strptime(start_str, "%Y-%m-%d").date()
+            days = int(days_str)
+            if days <= 0:
+                print("错误: 天数必须大于0！")
+                return
+            added = 0
+            for i in range(days):
+                d = start_date + timedelta(days=i)
+                if d not in scheduler.calendar.holidays:
+                    scheduler.calendar.add_holiday(d)
+                    added += 1
+            print(f"\n批量添加完成，共添加 {added} 个节假日。")
+        except ValueError:
+            print("错误: 输入格式不正确！")
+
+    elif choice == "5":
+        confirm = input("确定要清空所有节假日吗? (y/N): ").strip().lower()
+        if confirm in ('y', 'yes', '是'):
+            scheduler.calendar.holidays.clear()
+            print("\n已清空所有节假日。")
+        else:
+            print("已取消。")
+
+    else:
+        print("无效选择！")
+
+
+def manage_pause_resume(scheduler: ProductionScheduler, production_log: ProductionLog):
+    print("\n--- 登记暂停/恢复 ---")
+
+    in_production = scheduler.get_orders_by_status(OrderStatus.IN_PRODUCTION)
+    paused = scheduler.get_orders_by_status(OrderStatus.PAUSED)
+    all_orders = in_production + paused
+
+    if not all_orders:
+        print("没有可操作的订单。")
+        return
+
+    print("可操作的订单:")
+    for i, order in enumerate(all_orders, 1):
+        machine = next((m.name for m in scheduler.machines if m.machine_id == order.assigned_machine),
+                       order.assigned_machine)
+        status_str = "生产中" if order.status == OrderStatus.IN_PRODUCTION else "暂停中"
+        print(f"  {i}. {order.order_id} - {status_str} - 纸张:{order.paper_grammage}g "
+              f"印张:{order.completed_sheets}/{order.sheet_count} 机器:{machine}")
+
+    try:
+        choice = input("\n请输入订单序号或订单号: ").strip()
+        target_order = None
+
+        if choice.isdigit():
+            idx = int(choice) - 1
+            if 0 <= idx < len(all_orders):
+                target_order = all_orders[idx]
+        else:
+            for order in all_orders:
+                if order.order_id == choice:
+                    target_order = order
+                    break
+
+        if not target_order:
+            print("未找到该订单！")
+            return
+
+        if target_order.status == OrderStatus.IN_PRODUCTION:
+            print(f"\n当前订单状态: 生产中")
+            print("  1. 暂停订单")
+            action = input("请选择操作 (1): ").strip() or "1"
+            if action == "1":
+                reason = input("请输入暂停原因: ").strip()
+                if not reason:
+                    print("错误: 暂停原因不能为空！")
+                    return
+                if scheduler.pause_order(target_order.order_id, reason):
+                    production_log.add_event('order_paused', target_order.order_id,
+                                          target_order.assigned_machine, f"暂停原因: {reason}")
+                    print(f"订单 {target_order.order_id} 已暂停。")
+                else:
+                    print("暂停失败！")
+            else:
+                print("无效选择！")
+
+        elif target_order.status == OrderStatus.PAUSED:
+            print(f"\n当前订单状态: 暂停中")
+            if target_order.pause_records:
+                last_pause = target_order.pause_records[-1]
+                print(f"  暂停原因: {last_pause.get('reason', '未知')}")
+                print(f"  暂停时间: {last_pause.get('pause_time', '未知')}")
+            print("  1. 恢复订单")
+            action = input("请选择操作 (1): ").strip() or "1"
+            if action == "1":
+                if scheduler.resume_order(target_order.order_id):
+                    production_log.add_event('order_resumed', target_order.order_id,
+                                              target_order.assigned_machine, "订单恢复生产")
+                    print(f"订单 {target_order.order_id} 已恢复生产。")
+                else:
+                    print("恢复失败！")
+            else:
+                print("无效选择！")
+
+    except ValueError:
+        print("输入无效！")
+
+
+def record_downtime_ui(scheduler: ProductionScheduler, production_log: ProductionLog):
+    print("\n--- 异常停机登记 ---")
+
+    print("机器列表:")
+    for i, machine in enumerate(scheduler.machines, 1):
+        print(f"  {i}. {machine.name} ({machine.machine_id}): {machine.min_grammage}g-{machine.max_grammage}g")
+
+    try:
+        choice = input("\n请选择机器序号或机器ID: ").strip()
+        target_machine = None
+
+        if choice.isdigit():
+            idx = int(choice) - 1
+            if 0 <= idx < len(scheduler.machines):
+                target_machine = scheduler.machines[idx]
+        else:
+            for m in scheduler.machines:
+                if m.machine_id == choice:
+                    target_machine = m
+                    break
+
+        if not target_machine:
+            print("未找到该机器！")
+            return
+
+        reason = input("请输入停机原因: ").strip()
+        if not reason:
+            print("错误: 停机原因不能为空！")
+            return
+
+        print("\n停机类型:")
+        print("  1. 异常停机 (unplanned)")
+        print("  2. 计划停机 (planned)")
+        type_choice = input("请选择 (1-2, 默认1): ").strip() or "1"
+        downtime_type = 'unplanned' if type_choice == '1' else 'planned'
+
+        start_str = input("开始时间 (YYYY-MM-DD HH:MM, 回车默认当前时间): ").strip()
+        end_str = input("结束时间 (YYYY-MM-DD HH:MM, 回车表示未结束): ").strip()
+
+        try:
+            if start_str:
+                start_time = datetime.strptime(start_str, "%Y-%m-%d %H:%M")
+            else:
+                start_time = datetime.now()
+
+            end_time = None
+            if end_str:
+                end_time = datetime.strptime(end_str, "%Y-%m-%d %H:%M")
+        except ValueError:
+            print("错误: 时间格式不正确！")
+            return
+
+        current_order = scheduler.get_machine_current_order(target_machine.machine_id, start_time)
+        order_id = None
+        if current_order:
+            print(f"\n检测到该机器当前正在生产订单: {current_order.order_id}")
+            link = input("是否关联此订单? (Y/n): ").strip().lower()
+            if not link or link in ('y', 'yes', '是'):
+                order_id = current_order.order_id
+        else:
+            order_choice = input("\n请输入关联订单号 (回车不关联): ").strip()
+            if order_choice:
+                for o in scheduler.orders:
+                    if o.order_id == order_choice:
+                        order_id = order_choice
+                        break
+
+        record = scheduler.record_downtime(
+            machine_id=target_machine.machine_id,
+            start_time=start_time,
+            end_time=end_time,
+            reason=reason,
+            downtime_type=downtime_type,
+            order_id=order_id
+        )
+        production_log.add_event('downtime_recorded', order_id, target_machine.machine_id,
+                              f"停机登记: {reason}, 类型:{downtime_type}")
+
+        print(f"\n停机记录已保存！记录ID: {record.record_id}")
+        print(f"  机器: {target_machine.name}")
+        print(f"  类型: {'异常停机' if downtime_type == 'unplanned' else '计划停机'}")
+        print(f"  原因: {reason}")
+        print(f"  开始: {start_time.strftime('%Y-%m-%d %H:%M')}")
+        if end_time:
+            print(f"  结束: {end_time.strftime('%Y-%m-%d %H:%M')}")
+        else:
+            print(f"  结束: 未结束")
+        if order_id:
+            print(f"  关联订单: {order_id}")
+        print("\n提示: 下次执行滚动排程时将考虑此停机时段。")
+
+    except ValueError:
+        print("输入无效！")
+
+
+def save_data_ui(datastore: DataStore, scheduler: ProductionScheduler, production_log: ProductionLog):
+    print("\n--- 保存数据 ---")
+    result = datastore.save_all(
+        scheduler.orders,
+        scheduler.machines,
+        scheduler.calendar.to_dict(),
+        production_log,
+        scheduler.downtime_records
+    )
+    if result:
+        production_log.add_event('data_saved', None, None, "手动保存数据")
+        print("✅ 数据保存成功！")
+    else:
+        print("❌ 数据保存失败！")
+
+
+def load_data_ui(datastore: DataStore, scheduler: ProductionScheduler, production_log: ProductionLog):
+    print("\n--- 加载数据 ---")
+    if not datastore.has_saved_data():
+        print("没有找到保存的数据。")
+        return
+
+    confirm = input("加载数据将覆盖当前数据，是否继续? (y/N): ").strip().lower()
+    if confirm not in ('y', 'yes', '是'):
+        print("已取消加载。")
+        return
+
+    data = datastore.load_all()
+    if not data.get('exists'):
+        print("加载失败，没有保存的数据。")
+        return
+
+    scheduler.orders = data['orders']
+    if data['machines']:
+        scheduler.machines = data['machines']
+    else:
+        scheduler.machines = create_default_machines()
+    scheduler.machine_schedules = {m.machine_id: [] for m in scheduler.machines}
+
+    if data['calendar']:
+        scheduler.calendar = WorkCalendar.from_dict(data['calendar'])
+
+    if data['production_log']:
+        production_log.events = data['production_log'].events
+    else:
+        production_log.events = ProductionLog().events
+
+    scheduler.downtime_records = []
+    for dr in data.get('downtime_records', []):
+        from storage import _deserialize_datetime
+        scheduler.downtime_records.append(DowntimeRecord(
+            record_id=dr.get('record_id'),
+            machine_id=dr.get('machine_id'),
+            order_id=dr.get('order_id'),
+            start_time=_deserialize_datetime(dr.get('start_time')),
+            end_time=_deserialize_datetime(dr.get('end_time')),
+            reason=dr.get('reason', ''),
+            downtime_type=dr.get('downtime_type', 'unplanned')
+        ))
+
+    production_log.add_event('data_loaded', None, None, "加载保存的数据")
+
+    print(f"\n✅ 数据加载成功！")
+    print(f"  加载订单: {len(scheduler.orders)} 个")
+    print(f"  加载机器: {len(scheduler.machines)} 台")
+    print(f"  加载停机记录: {len(scheduler.downtime_records)} 条")
+    if data.get('saved_at'):
+        print(f"  数据保存时间: {data['saved_at']}")
+
+
+def export_daily_report_ui(scheduler: ProductionScheduler):
+    print("\n--- 生产日报导出 ---")
+    date_str = input("请输入日期 (YYYY-MM-DD, 回车默认今天): ").strip()
+    try:
+        if date_str:
+            report_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+        else:
+            report_date = date.today()
+    except ValueError:
+        print("错误: 日期格式不正确！")
+        return
+
+    report = scheduler.generate_daily_report(report_date)
+
+    print(f"\n{'='*70}")
+    print(f"                  生产日报 - {report_date.strftime('%Y-%m-%d')}")
+    print(f"{'='*70}")
+
+    summary = report.get('summary', {})
+    print(f"\n📊 汇总统计:")
+    print(f"  完成订单数: {summary.get('total_completed', 0)}")
+    print(f"  在制订单数: {summary.get('total_in_production', 0)}")
+    print(f"  延期订单数: {summary.get('total_delayed', 0)}")
+    print(f"  完成总印张: {summary.get('total_sheets', 0)}")
+
+    print(f"\n⚙️  各机器详情:")
+    print("-" * 70)
+    print(f"{'机器':<15} {'完成数':<8} {'完成印张':<10} {'在制订单':<20} {'延期订单':<15} {'利用率':<8}")
+    print("-" * 70)
+    machines = report.get('machines', {})
+    for machine_id, machine_data in machines.items():
+        utilization = machine_data.get('utilization', 0)
+        in_prod = '、'.join(machine_data.get('in_production_orders', [])) or '-'
+        delayed = '、'.join(machine_data.get('delayed_orders', [])) or '-'
+        print(f"{machine_data.get('machine_name', machine_id):<15} "
+              f"{machine_data.get('completed_count', 0):<8} "
+              f"{machine_data.get('completed_sheets', 0):<10} "
+              f"{in_prod:<20} "
+              f"{delayed:<15} "
+              f"{utilization:.0%}")
+    print("-" * 70)
+
+    export_confirm = input("\n是否导出CSV? (Y/n): ").strip().lower()
+    if not export_confirm or export_confirm in ('y', 'yes', '是'):
+        default_path = f"daily_report_{report_date.strftime('%Y%m%d')}.csv"
+        file_path = input(f"导出文件路径 (默认: {default_path}): ").strip() or default_path
+        if export_daily_report_to_csv(report, file_path):
+            print(f"✅ 日报已导出到: {file_path}")
+        else:
+            print("❌ 导出失败！")
+
+
 def main():
+    datastore = DataStore()
+    production_log = ProductionLog()
     machines = create_default_machines()
-    scheduler = ProductionScheduler(machines)
+    scheduler = ProductionScheduler(machines, calendar=WorkCalendar())
 
     print("\n" + "=" * 65)
-    print("           欢迎使用印刷厂生产排程系统 v2.0")
+    print("           欢迎使用印刷厂生产排程系统 v3.0")
     print("=" * 65)
-    print(f"已配置 {len(machines)} 台印刷机:")
-    for m in machines:
+
+    if datastore.has_saved_data():
+        print("\n检测到已保存的数据。")
+        load_choice = input("是否加载保存的数据? (Y/n): ").strip().lower()
+        if not load_choice or load_choice in ('y', 'yes', '是'):
+            data = datastore.load_all()
+            if data.get('exists'):
+                scheduler.orders = data['orders']
+                if data['machines']:
+                    scheduler.machines = data['machines']
+                scheduler.machine_schedules = {m.machine_id: [] for m in scheduler.machines}
+                if data['calendar']:
+                    scheduler.calendar = WorkCalendar.from_dict(data['calendar'])
+                if data['production_log']:
+                    production_log.events = data['production_log'].events
+                scheduler.downtime_records = []
+                for dr in data.get('downtime_records', []):
+                    from storage import _deserialize_datetime
+                    scheduler.downtime_records.append(DowntimeRecord(
+                        record_id=dr.get('record_id'),
+                        machine_id=dr.get('machine_id'),
+                        order_id=dr.get('order_id'),
+                        start_time=_deserialize_datetime(dr.get('start_time')),
+                        end_time=_deserialize_datetime(dr.get('end_time')),
+                        reason=dr.get('reason', ''),
+                        downtime_type=dr.get('downtime_type', 'unplanned')
+                    ))
+                production_log.add_event('data_loaded', None, None, "启动时加载数据")
+                print(f"✅ 已加载数据: {len(scheduler.orders)} 个订单, {len(scheduler.machines)} 台机器")
+            else:
+                print("❌ 加载数据失败，使用默认配置。")
+
+    print(f"\n已配置 {len(scheduler.machines)} 台印刷机:")
+    for m in scheduler.machines:
         print(f"  {m.name} ({m.machine_id}): {m.min_grammage}g-{m.max_grammage}g, "
               f"速度 {m.speed_per_hour} 印张/小时")
     print("\n提示: 本系统支持滚动排程、延误风险分析、生产进度跟踪等功能。")
@@ -776,43 +1283,84 @@ def main():
 
     while True:
         print_menu()
-        choice = input("\n请选择操作 (0-15): ").strip()
+        choice = input("\n请选择操作 (0-22): ").strip()
+
+        need_autosave = False
 
         if choice == '0':
+            print("\n正在保存数据...")
+            datastore.save_all(
+                scheduler.orders, scheduler.machines,
+                scheduler.calendar.to_dict(),
+                production_log, scheduler.downtime_records)
+            production_log.add_event('data_saved', None, None, "退出时自动保存")
             print("\n感谢使用，再见！")
             break
         elif choice == '1':
             view_all_orders(scheduler)
         elif choice == '2':
-            add_order(scheduler)
+            add_order(scheduler, production_log)
+            need_autosave = True
         elif choice == '3':
             modify_order_delivery(scheduler)
         elif choice == '4':
-            run_schedule(scheduler)
+            run_schedule(scheduler, production_log)
+            need_autosave = True
         elif choice == '5':
-            insert_urgent_order(scheduler)
+            insert_urgent_order(scheduler, production_log)
+            need_autosave = True
         elif choice == '6':
             view_gantt(scheduler)
         elif choice == '7':
-            mark_order_started(scheduler)
+            mark_order_started(scheduler, production_log)
+            need_autosave = True
         elif choice == '8':
-            mark_order_completed_ui(scheduler)
+            mark_order_completed_ui(scheduler, production_log)
+            need_autosave = True
         elif choice == '9':
             update_order_progress_ui(scheduler)
+            need_autosave = True
         elif choice == '10':
-            auto_update_status(scheduler)
+            auto_update_status(scheduler, production_log)
+            need_autosave = True
         elif choice == '11':
             show_material_suggestions(scheduler)
         elif choice == '12':
             show_delay_risks(scheduler)
         elif choice == '13':
-            import_orders(scheduler)
+            import_orders(scheduler, production_log)
+            need_autosave = True
         elif choice == '14':
             export_schedule(scheduler)
         elif choice == '15':
             export_orders(scheduler)
+        elif choice == '16':
+            manage_shifts(scheduler)
+            need_autosave = True
+        elif choice == '17':
+            manage_holidays(scheduler)
+            need_autosave = True
+        elif choice == '18':
+            manage_pause_resume(scheduler, production_log)
+            need_autosave = True
+        elif choice == '19':
+            record_downtime_ui(scheduler, production_log)
+            need_autosave = True
+        elif choice == '20':
+            save_data_ui(datastore, scheduler, production_log)
+        elif choice == '21':
+            load_data_ui(datastore, scheduler, production_log)
+            need_autosave = True
+        elif choice == '22':
+            export_daily_report_ui(scheduler)
         else:
             print("无效选择，请重新输入！")
+
+        if choice != '0' and need_autosave:
+            datastore.save_all(
+                scheduler.orders, scheduler.machines,
+                scheduler.calendar.to_dict(),
+                production_log, scheduler.downtime_records)
 
         if choice != '0':
             input("\n按回车键继续...")
@@ -820,5 +1368,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-

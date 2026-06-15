@@ -9,10 +9,12 @@ STATUS_MAP = {
     '未开工': OrderStatus.NOT_STARTED,
     '生产中': OrderStatus.IN_PRODUCTION,
     '已完成': OrderStatus.COMPLETED,
+    '暂停中': OrderStatus.PAUSED,
     'PENDING': OrderStatus.PENDING,
     'NOT_STARTED': OrderStatus.NOT_STARTED,
     'IN_PRODUCTION': OrderStatus.IN_PRODUCTION,
     'COMPLETED': OrderStatus.COMPLETED,
+    'PAUSED': OrderStatus.PAUSED,
 }
 
 
@@ -251,6 +253,40 @@ def export_schedule_to_csv(slots: List[ScheduleSlot], file_path: str) -> bool:
         return True
     except Exception as e:
         print(f"错误: 导出排程CSV失败 - {e}")
+        return False
+
+
+def export_daily_report_to_csv(report: Dict, file_path: str) -> bool:
+    try:
+        with open(file_path, 'w', encoding='utf-8-sig', newline='') as f:
+            writer = csv.writer(f)
+            report_date = report.get('report_date')
+            summary = report.get('summary', {})
+            writer.writerow(['日期', '完成订单数', '在制订单数', '延期订单数', '完成总印张'])
+            writer.writerow([
+                report_date.strftime('%Y-%m-%d') if report_date else '',
+                summary.get('total_completed', 0),
+                summary.get('total_in_production', 0),
+                summary.get('total_delayed', 0),
+                summary.get('total_sheets', 0)
+            ])
+            writer.writerow([])
+            writer.writerow(['机器ID', '完成订单数', '完成印张', '在制订单', '延期订单', '利用率%'])
+            machines = report.get('machines', {})
+            for machine_id, machine_data in machines.items():
+                utilization = machine_data.get('utilization', 0)
+                utilization_pct = round(utilization * 100, 2)
+                writer.writerow([
+                    machine_id,
+                    machine_data.get('completed_count', 0),
+                    machine_data.get('completed_sheets', 0),
+                    '、'.join(machine_data.get('in_production_orders', [])),
+                    '、'.join(machine_data.get('delayed_orders', [])),
+                    utilization_pct
+                ])
+        return True
+    except Exception as e:
+        print(f"错误: 导出生产日报CSV失败 - {e}")
         return False
 
 
