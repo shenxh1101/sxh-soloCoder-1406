@@ -6,7 +6,7 @@ from typing import Optional
 
 class OrderStatus(Enum):
     PENDING = "待排产"
-    SCHEDULED = "已排产"
+    NOT_STARTED = "未开工"
     IN_PRODUCTION = "生产中"
     COMPLETED = "已完成"
 
@@ -20,13 +20,44 @@ class Order:
     status: OrderStatus = OrderStatus.PENDING
     is_urgent: bool = False
     assigned_machine: Optional[str] = None
-    start_time: Optional[datetime] = None
-    end_time: Optional[datetime] = None
+    scheduled_start: Optional[datetime] = None
+    scheduled_end: Optional[datetime] = None
+    actual_start: Optional[datetime] = None
+    actual_end: Optional[datetime] = None
+    completed_sheets: int = 0
+    notes: str = ""
 
     def production_hours(self, speed_per_hour: int) -> float:
         if speed_per_hour <= 0:
             return float('inf')
         return self.sheet_count / speed_per_hour
+
+    @property
+    def start_time(self) -> Optional[datetime]:
+        return self.actual_start or self.scheduled_start
+
+    @property
+    def end_time(self) -> Optional[datetime]:
+        return self.actual_end or self.scheduled_end
+
+    @property
+    def progress(self) -> float:
+        if self.sheet_count <= 0:
+            return 0.0
+        return min(self.completed_sheets / self.sheet_count, 1.0)
+
+    @property
+    def is_delayed(self) -> bool:
+        if not self.end_time:
+            return False
+        end_date = self.end_time.date()
+        return end_date > self.delivery_date
+
+    @property
+    def delay_days(self) -> int:
+        if not self.end_time or not self.is_delayed:
+            return 0
+        return (self.end_time.date() - self.delivery_date).days
 
 
 @dataclass
