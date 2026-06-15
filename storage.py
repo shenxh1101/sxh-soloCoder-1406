@@ -22,6 +22,16 @@ def _deserialize_date(s: Optional[str]) -> Optional[date]:
 
 
 def order_to_dict(order: Order) -> Dict:
+    pause_records = []
+    for pr in order.pause_records:
+        record = {}
+        for k, v in pr.items():
+            if isinstance(v, datetime):
+                record[k] = _serialize_datetime(v)
+            else:
+                record[k] = v
+        pause_records.append(record)
+
     return {
         "order_id": order.order_id,
         "paper_grammage": order.paper_grammage,
@@ -36,6 +46,8 @@ def order_to_dict(order: Order) -> Dict:
         "actual_end": _serialize_datetime(order.actual_end),
         "completed_sheets": order.completed_sheets,
         "notes": order.notes,
+        "pause_records": pause_records,
+        "shift": order.shift,
     }
 
 
@@ -56,6 +68,22 @@ def dict_to_order(data: Dict) -> Order:
     order.scheduled_end = _deserialize_datetime(data.get("scheduled_end"))
     order.actual_start = _deserialize_datetime(data.get("actual_start"))
     order.actual_end = _deserialize_datetime(data.get("actual_end"))
+    order.shift = data.get("shift")
+
+    raw_pause_records = data.get("pause_records", [])
+    for pr in raw_pause_records:
+        record = {}
+        for k, v in pr.items():
+            if isinstance(v, str) and k.endswith("_time"):
+                deserialized = _deserialize_datetime(v)
+                if deserialized is not None:
+                    record[k] = deserialized
+                else:
+                    record[k] = v
+            else:
+                record[k] = v
+        order.pause_records.append(record)
+
     return order
 
 

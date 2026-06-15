@@ -86,8 +86,8 @@ class WorkCalendar:
         periods: List[Tuple[datetime, datetime, Shift]] = []
         if end_dt is None:
             end_dt = start_dt + timedelta(days=365)
-        current = start_dt.date()
-        end_date = end_dt.date()
+        current = start_dt.date() - timedelta(days=1)
+        end_date = end_dt.date() + timedelta(days=1)
         while current <= end_date:
             if self.is_work_day(current):
                 for shift in sorted(self.shifts, key=lambda s: s.start_time):
@@ -102,14 +102,17 @@ class WorkCalendar:
         return periods
 
     def next_working_start(self, from_dt: datetime) -> datetime:
-        current = from_dt
-        for _ in range(3650):
-            if self.is_work_day(current.date()):
+        for (s, e, shift) in self.get_working_periods(from_dt, from_dt + timedelta(days=1)):
+            if s <= from_dt <= e:
+                return from_dt
+            if s >= from_dt:
+                return s
+        for offset in range(1, 3650):
+            check_date = from_dt.date() + timedelta(days=offset)
+            if self.is_work_day(check_date):
                 for shift in sorted(self.shifts, key=lambda s: s.start_time):
-                    shift_start = datetime.combine(current.date(), shift.start_time)
-                    if shift_start >= from_dt:
-                        return shift_start
-            current += timedelta(days=1)
+                    shift_start = datetime.combine(check_date, shift.start_time)
+                    return shift_start
         return from_dt
 
     def add_hours(self, start_dt: datetime, hours: float) -> datetime:

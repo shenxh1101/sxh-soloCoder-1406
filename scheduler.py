@@ -56,12 +56,25 @@ class ProductionScheduler:
                     order.status = OrderStatus.COMPLETED
                     order.completed_sheets = order.sheet_count
                     stats['completed'] += 1
+                elif order.scheduled_end and order.scheduled_end <= current_time:
+                    order.status = OrderStatus.COMPLETED
+                    order.completed_sheets = order.sheet_count
+                    if order.actual_end is None:
+                        order.actual_end = order.scheduled_end
+                    stats['completed'] += 1
                 else:
                     stats['no_change'] += 1
                 continue
 
             if order.status == OrderStatus.PAUSED:
-                stats['no_change'] += 1
+                if order.scheduled_end and order.scheduled_end <= current_time:
+                    order.status = OrderStatus.COMPLETED
+                    order.completed_sheets = order.sheet_count
+                    if order.actual_end is None:
+                        order.actual_end = order.scheduled_end
+                    stats['completed'] += 1
+                else:
+                    stats['no_change'] += 1
                 continue
 
             if order.status == OrderStatus.NOT_STARTED:
